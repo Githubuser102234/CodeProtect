@@ -57,7 +57,6 @@
     <pre id="log"></pre>
   </section>
 
-  <!-- Firebase & app -->
   <script type="module">
   // ----- Firebase config (provided) -----
   const firebaseConfig = {
@@ -74,7 +73,6 @@
   import { getAnalytics } from "https://www.gstatic.com/firebasejs/12.2.1/firebase-analytics.js";
   import { getAuth, signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.2.1/firebase-auth.js";
   import { getFirestore, doc, setDoc, getDoc, addDoc, collection, query, where, getDocs, orderBy } from "https://www.gstatic.com/firebasejs/12.2.1/firebase-firestore.js";
-  import { getStorage, ref as storageRef, uploadBytes, getBytes } from "https://www.gstatic.com/firebasejs/12.2.1/firebase-storage.js";
 
   // init
   const app = initializeApp(firebaseConfig);
@@ -82,7 +80,6 @@
 
   const auth = getAuth(app);
   const db = getFirestore(app);
-  const storage = getStorage(app);
 
   // UI elements
   const authControls = document.getElementById('auth-controls');
@@ -294,6 +291,7 @@
     // 2) Encrypt file content
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const cipherBuf = await crypto.subtle.encrypt({ name:"AES-GCM", iv }, aesKey, arrayBuffer);
+    const cipherB64 = ab2b64(cipherBuf);
 
     // 3) Wrap AES key for each recipient (RSA-OAEP using their public key)
     const wrappedList = [];
@@ -318,24 +316,19 @@
       }
     }
 
-    // 4) Upload ciphertext to Storage and metadata to Firestore
+    // 4) Record metadata and ciphertext to Firestore
     const fileId = crypto.randomUUID();
-    uploadLog.textContent = 'Uploading ciphertext to Firebase Storage...';
-    const storagePath = `files/${fileId}.enc`;
-    const sRef = storageRef(storage, storagePath);
-    // cipherBuf is ArrayBuffer -> convert to Uint8Array
-    await uploadBytes(sRef, new Uint8Array(cipherBuf));
-    uploadLog.textContent = 'Recording metadata to Firestore...';
+    uploadLog.textContent = 'Recording metadata and file data to Firestore...';
     // metadata
     await setDoc(doc(db,'files',fileId), {
       owner: currentUser.uid,
       ownerEmail: currentUser.email,
       filename: f.name,
       createdAt: Date.now(),
-      storagePath,
       iv_b64: ab2b64(iv),
       recipients: wrappedList,
-      recipientsUids: wrappedList.map(w => w.uid)
+      recipientsUids: wrappedList.map(w => w.uid),
+      fileData_b64: cipherB64 // Store the Base64 data directly
     });
     uploadLog.textContent = `Uploaded & protected as fileId: ${fileId}`;
     log(`Uploaded file ${f.name} as ${fileId}, recipients: ${wrappedList.map(r=>r.email).join(',')}`);
@@ -362,9 +355,10 @@
     // import AES key
     const aesKey = await crypto.subtle.importKey('raw', rawAes, { name:"AES-GCM" }, false, ["decrypt"]);
 
-    // fetch ciphertext
-    const sRef = storageRef(storage, fileDoc.storagePath);
-    const cipherBytes = await getBytes(sRef); // Uint8Array
+    // get ciphertext from Firestore
+    const cipherB64 = fileDoc.fileData_b64;
+    if (!cipherB64) throw new Error('No file data found in document.');
+    const cipherBytes = b642ab(cipherB64); // convert from Base64 to ArrayBuffer
     const iv = b642ab(fileDoc.iv_b64);
     // decrypt
     const plainBuf = await crypto.subtle.decrypt({ name:"AES-GCM", iv: new Uint8Array(iv) }, aesKey, cipherBytes);
