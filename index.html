@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>CodeProtect (Firebase MVP)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; max-width: 920px; margin: 24px auto; }
+    header { display:flex; gap:12px; align-items:center; margin-bottom: 12px; }
+    .box { border:1px solid #ddd; padding:12px; border-radius:8px; margin-bottom:12px; }
+    button { margin:6px 0; }
+    input[type="text"], input[type="email"] { width: 100%; padding:8px; }
+    label { font-weight:600; display:block; margin-top:8px; }
+    .files-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    pre { white-space:pre-wrap; word-break:break-all; background:#f9f9f9; padding:8px; border-radius:6px; }
+    small { color:#666; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>CodeProtect (Firebase MVP)</h1>
+    <div id="auth-controls"></div>
+  </header>
+
+  <section class="box" id="keys-box">
+    <h3>Your crypto keys</h3>
+    <div id="key-status">Not signed in</div>
+    <button id="gen-keys-btn">Generate & Publish Keypair</button>
+    <button id="export-priv-btn">Export Private Key (Backup)</button>
+    <input type="file" id="import-priv-file" style="display:none" />
+    <button id="import-priv-btn">Import Private Key (Restore)</button>
+    <p><small>Private key is stored in your browser localStorage. Keep a backup if you want to decrypt later on other devices.</small></p>
+  </section>
+
+  <section class="box">
+    <h3>Upload & Protect a file</h3>
+    <label>Choose file to encrypt & upload</label>
+    <input type="file" id="file-input" />
+    <label>Recipients (comma-separated recipient emails)</label>
+    <input type="text" id="recipients-input" placeholder="alice@example.com, bob@example.com" />
+    <button id="upload-btn">Encrypt & Upload</button>
+    <div id="upload-log"></div>
+  </section>
+
+  <section class="box">
+    <h3>Your Files</h3>
+    <div id="owned-files"></div>
+  </section>
+
+  <section class="box">
+    <h3>Files Shared To You</h3>
+    <div id="shared-files"></div>
+  </section>
+
+  <section class="box">
+    <h3>Raw Debug / Logs</h3>
+    <pre id="log"></pre>
+  </section>
+
+  <!-- Firebase & app -->
+  <script type="module">
+  // ----- Firebase config (provided) -----
+  const firebaseConfig = {
+    apiKey: "AIzaSyB74KIGvDUbgNriyPZGydsMpieOqEHtr6Y",
+    authDomain: "codeprotect-69284.firebaseapp.com",
+    projectId: "codeprotect-69284",
+    storageBucket: "codeprotect-69284.firebasestorage.app",
+    messagingSenderId: "760987953493",
+    appId: "1:760987953493:web:e4dbce48ce20533de5a7dc",
+    measurementId: "G-YR2F3QE37D"
+  };
+
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/12.2.1/firebase-app.js";
+  import { getAnalytics } from "https://www.gstatic.com/firebasejs/12.2.1/firebase-analytics.js";
+  import { getAuth, signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.2.1/firebase-auth.js";
+  import { getFirestore, doc, setDoc, getDoc, addDoc, collection, query, where, getDocs, orderBy } from "https://www.gstatic.com/firebasejs/12.2.1/firebase-firestore.js";
+  import { getStorage, ref as storageRef, uploadBytes, getBytes } from "https://www.gstatic.com/firebasejs/12.2.1/firebase-storage.js";
+
+  // init
+  const app = initializeApp(firebaseConfig);
+  try { getAnalytics(app); } catch(e) { /* analytics may fail in some envs */ }
+
+  const auth = getAuth(app);
+  const db = getFirestore(app);
+  const storage = getStorage(app);
+
+  // UI elements
+  const authControls = document.getElementById('auth-controls');
+  const logEl = document.getElementById('log');
+  const keyStatus = document.getElementById('key-status');
+  const genKeysBtn = document.getElementById('gen-keys-btn');
+  const exportPrivBtn = document.getElementById('export-priv-btn');
+  const importPrivBtn = document.getElementById('import-priv-btn');
+  const importPrivFile = document.getElementById('import-priv-file');
+
+  const fileInput = document.getElementById('file-input');
+  const recipientsInput = document.getElementById('recipients-input');
+  const uploadBtn = document.getElementById('upload-btn');
+  const uploadLog = document.getElementById('upload-log');
+
+  const ownedFilesEl = document.getElementById('owned-files');
+  const sharedFilesEl = document.getElementById('shared-files');
+
+  // helpers: base64 <-> ArrayBuffer
+  function ab2b64(buf) {
+    const u8 = new Uint8Array(buf);
+    let binary = '';
+    for (let i=0;i<u8.length;i++) binary += String.fromCharCode(u8[i]);
+    return btoa(binary);
+  }
+  function b642ab(b64) {
+    const binary = atob(b64);
+    const len = binary.length;
+    const buf = new Uint8Array(len);
+    for (let i=0;i<len;i++) buf[i]=binary.charCodeAt(i);
+    return buf.buffer;
+  }
+
+  function log(s){
+    console.log(s);
+    logEl.textContent = `${new Date().toLocaleTimeString()} — ${s}\n` + logEl.textContent;
+  }
+
+  // Auth UI and flows
+  let currentUser = null;
+  function renderAuth(user){
+    authControls.innerHTML = '';
+    if (!user) {
+      const btn = document.createElement('button');
+      btn.textContent = 'Sign in with Google';
+      btn.onclick = async () => {
+        const provider = new GoogleAuthProvider();
+        await signInWithPopup(auth, provider);
+      };
+      authControls.appendChild(btn);
+    } else {
+      const span = document.createElement('span');
+      span.textContent = `Signed in as ${user.email}`;
+      const outBtn = document.createElement('button');
+      outBtn.textContent = 'Sign out';
+      outBtn.onclick = () => signOut(auth);
+      authControls.appendChild(span);
+      authControls.appendChild(outBtn);
+    }
+  }
+
+  onAuthStateChanged(auth, async (user) => {
+    currentUser = user;
+    renderAuth(user);
+    if (user) {
+      await ensureUserRecord(user);
+      await refreshKeyStatusUI();
+      await queryAndRenderFiles();
+    } else {
+      keyStatus.textContent = 'Not signed in';
+      ownedFilesEl.innerHTML = '';
+      sharedFilesEl.innerHTML = '';
+    }
+  });
+
+  // ----- Key management -----
+  // Private key stored in localStorage under "cp_priv_pkcs8_b64"
+  // Public key published to Firestore users/{uid} with { email, publicKey_spki_b64 }
+  async function generateAndPublishKeyPair() {
+    if (!currentUser) { alert('Sign in first'); return; }
+    // Generate RSA-OAEP key pair (2048)
+    const kp = await crypto.subtle.generateKey(
+      { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1,0,1]), hash: "SHA-256" },
+      true,
+      ["encrypt","decrypt"]
+    );
+    // export
+    const pubSpki = await crypto.subtle.exportKey("spki", kp.publicKey);
+    const privPkcs8 = await crypto.subtle.exportKey("pkcs8", kp.privateKey);
+    const pubB64 = ab2b64(pubSpki);
+    const privB64 = ab2b64(privPkcs8);
+
+    // store private locally
+    localStorage.setItem('cp_priv_pkcs8_b64', privB64);
+    log(`Local private key stored (backup recommended)`);
+
+    // publish public key to Firestore under users/{uid}
+    const userDoc = doc(db, "users", currentUser.uid);
+    await setDoc(userDoc, {
+      email: currentUser.email,
+      publicKey_spki_b64: pubB64,
+      createdAt: Date.now()
+    }, { merge: true });
+    log(`Published public key for ${currentUser.email} to Firestore`);
+    await refreshKeyStatusUI();
+  }
+
+  async function ensureUserRecord(user){
+    // Ensure user doc exists (if they haven't generated public key user doc will still be created so others can detect absence)
+    const uDocRef = doc(db, 'users', user.uid);
+    const snap = await getDoc(uDocRef);
+    if (!snap.exists()) {
+      await setDoc(uDocRef, { email: user.email, createdAt: Date.now() }, { merge: true });
+      log(`Created user record for ${user.email}`);
+    } else {
+      // nothing
+    }
+  }
+
+  async function refreshKeyStatusUI(){
+    const privB64 = localStorage.getItem('cp_priv_pkcs8_b64');
+    const pubB64FromFirestore = currentUser ? (await getDoc(doc(db,'users',currentUser.uid))).data()?.publicKey_spki_b64 : null;
+    if (privB64 && pubB64FromFirestore) {
+      keyStatus.textContent = `Keypair available. Public key published.`;
+    } else if (privB64 && !pubB64FromFirestore) {
+      keyStatus.textContent = `Private key present locally, but public key not published. Click "Generate & Publish" to publish.`;
+    } else if (!privB64 && pubB64FromFirestore) {
+      keyStatus.textContent = `Public key exists on server, but private key missing locally. Import private key to decrypt.`;
+    } else {
+      keyStatus.textContent = `No keypair. Click "Generate & Publish Keypair".`;
+    }
+  }
+
+  genKeysBtn.onclick = generateAndPublishKeyPair;
+
+  // Export private key button
+  exportPrivBtn.onclick = async () => {
+    const privB64 = localStorage.getItem('cp_priv_pkcs8_b64');
+    if (!privB64) return alert('No private key found in this browser to export.');
+    // create downloadable file
+    const blob = new Blob([privB64], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${currentUser?.email || 'private'}.cp_priv.b64.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  // Import private key
+  importPrivBtn.onclick = () => importPrivFile.click();
+  importPrivFile.onchange = async (ev) => {
+    const f = ev.target.files[0];
+    if (!f) return;
+    const txt = await f.text();
+    // validate b64
+    try {
+      b642ab(txt); // will throw if invalid
+      localStorage.setItem('cp_priv_pkcs8_b64', txt);
+      alert('Imported private key (stored locally).');
+      await refreshKeyStatusUI();
+    } catch(e) {
+      alert('Invalid private key file (must contain base64 pkcs8).');
+    }
+    importPrivFile.value = '';
+  };
+
+  // ----- Upload & encryption flow -----
+  async function lookupUsersByEmails(emails){
+    // Return map email -> userDocData (with uid and publicKey_spki_b64)
+    const out = {};
+    for (const e of emails) {
+      const q = query(collection(db, 'users'), where('email','==', e));
+      const snaps = await getDocs(q);
+      if (snaps.empty) { out[e] = null; continue; }
+      const docSnap = snaps.docs[0];
+      out[e] = { uid: docSnap.id, ...docSnap.data() };
+    }
+    return out;
+  }
+
+  uploadBtn.onclick = async () => {
+    uploadLog.textContent = '';
+    if (!currentUser) return alert('Sign in first');
+    const f = fileInput.files?.[0];
+    if (!f) return alert('Choose a file');
+    const recipientEmails = recipientsInput.value.split(',').map(s=>s.trim()).filter(s=>s);
+    if (recipientEmails.length === 0) return alert('Enter at least one recipient email (they must have generated a public key at least once).');
+
+    uploadLog.textContent = 'Looking up recipients...';
+    const usersMap = await lookupUsersByEmails(recipientEmails);
+    const missing = [];
+    const recipients = [];
+    for (const email of recipientEmails) {
+      const u = usersMap[email];
+      if (!u || !u.publicKey_spki_b64) missing.push(email);
+      else recipients.push(u);
+    }
+    if (missing.length) {
+      uploadLog.textContent = `Missing public keys for: ${missing.join(', ')} — ask them to Sign in & Generate keys.`;
+      return;
+    }
+
+    uploadLog.textContent = 'Encrypting file...';
+    const arrayBuffer = await f.arrayBuffer();
+
+    // 1) Generate AES-GCM file key
+    const aesKey = await crypto.subtle.generateKey({ name:"AES-GCM", length:256 }, true, ["encrypt","decrypt"]);
+    const rawAes = await crypto.subtle.exportKey("raw", aesKey); // ArrayBuffer
+
+    // 2) Encrypt file content
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const cipherBuf = await crypto.subtle.encrypt({ name:"AES-GCM", iv }, aesKey, arrayBuffer);
+
+    // 3) Wrap AES key for each recipient (RSA-OAEP using their public key)
+    const wrappedList = [];
+    for (const r of recipients) {
+      const pubSpkiBuf = b642ab(r.publicKey_spki_b64);
+      const pubKey = await crypto.subtle.importKey("spki", pubSpkiBuf, { name:"RSA-OAEP", hash:"SHA-256" }, false, ["encrypt"]);
+      const wrapped = await crypto.subtle.encrypt({ name:"RSA-OAEP" }, pubKey, rawAes);
+      wrappedList.push({ uid: r.uid, email: r.email, wrappedB64: ab2b64(wrapped) });
+    }
+
+    // Also wrap for owner themselves (if owner hasn't included themselves as recipient)
+    if (!recipients.some(r=>r.uid === currentUser.uid)) {
+      // get owner's pub from Firestore
+      const ownerDoc = await getDoc(doc(db,'users',currentUser.uid));
+      const ownerPubB64 = ownerDoc.data()?.publicKey_spki_b64;
+      if (ownerPubB64) {
+        const pubKey = await crypto.subtle.importKey("spki", b642ab(ownerPubB64), { name:"RSA-OAEP", hash:"SHA-256" }, false, ["encrypt"]);
+        const wrapped = await crypto.subtle.encrypt({ name:"RSA-OAEP" }, pubKey, rawAes);
+        wrappedList.push({ uid: currentUser.uid, email: currentUser.email, wrappedB64: ab2b64(wrapped) });
+      } else {
+        log('WARNING: owner has no published public key; you may not be able to decrypt unless you published a key.');
+      }
+    }
+
+    // 4) Upload ciphertext to Storage and metadata to Firestore
+    const fileId = crypto.randomUUID();
+    uploadLog.textContent = 'Uploading ciphertext to Firebase Storage...';
+    const storagePath = `files/${fileId}.enc`;
+    const sRef = storageRef(storage, storagePath);
+    // cipherBuf is ArrayBuffer -> convert to Uint8Array
+    await uploadBytes(sRef, new Uint8Array(cipherBuf));
+    uploadLog.textContent = 'Recording metadata to Firestore...';
+    // metadata
+    await setDoc(doc(db,'files',fileId), {
+      owner: currentUser.uid,
+      ownerEmail: currentUser.email,
+      filename: f.name,
+      createdAt: Date.now(),
+      storagePath,
+      iv_b64: ab2b64(iv),
+      recipients: wrappedList,
+      recipientsUids: wrappedList.map(w => w.uid)
+    });
+    uploadLog.textContent = `Uploaded & protected as fileId: ${fileId}`;
+    log(`Uploaded file ${f.name} as ${fileId}, recipients: ${wrappedList.map(r=>r.email).join(',')}`);
+    fileInput.value = '';
+    recipientsInput.value = '';
+    await queryAndRenderFiles();
+  };
+
+  // ----- Download & decrypt flow -----
+  async function tryDecryptFile(fileDoc) {
+    // find wrapped entry for current user
+    const wrapped = (fileDoc.recipients || []).find(r => r.uid === currentUser.uid);
+    if (!wrapped) throw new Error('No wrapped key for current user (not a recipient).');
+
+    const privB64 = localStorage.getItem('cp_priv_pkcs8_b64');
+    if (!privB64) throw new Error('No private key in this browser — import or generate one.');
+
+    const privPkcs8Buf = b642ab(privB64);
+    const privKey = await crypto.subtle.importKey('pkcs8', privPkcs8Buf, { name:"RSA-OAEP", hash:"SHA-256" }, false, ["decrypt"]);
+    // decrypt wrapped key
+    const wrappedBuf = b642ab(wrapped.wrappedB64);
+    const rawAes = await crypto.subtle.decrypt({ name:"RSA-OAEP" }, privKey, wrappedBuf); // ArrayBuffer
+
+    // import AES key
+    const aesKey = await crypto.subtle.importKey('raw', rawAes, { name:"AES-GCM" }, false, ["decrypt"]);
+
+    // fetch ciphertext
+    const sRef = storageRef(storage, fileDoc.storagePath);
+    const cipherBytes = await getBytes(sRef); // Uint8Array
+    const iv = b642ab(fileDoc.iv_b64);
+    // decrypt
+    const plainBuf = await crypto.subtle.decrypt({ name:"AES-GCM", iv: new Uint8Array(iv) }, aesKey, cipherBytes);
+    return plainBuf;
+  }
+
+  // Render lists and wire up decrypt buttons
+  async function queryAndRenderFiles(){
+    ownedFilesEl.innerHTML = '';
+    sharedFilesEl.innerHTML = '';
+    if (!currentUser) return;
+
+    // Query owned files
+    const qOwned = query(collection(db,'files'), where('owner','==', currentUser.uid));
+    const ownedSnaps = await getDocs(qOwned);
+    if (ownedSnaps.empty) ownedFilesEl.textContent = '(none)';
+    else {
+      for (const d of ownedSnaps.docs) {
+        const data = d.data();
+        const card = document.createElement('div');
+        card.className = 'box';
+        card.innerHTML = `<strong>${data.filename}</strong><div>fileId: ${d.id}</div><div>recipients: ${ (data.recipients||[]).map(r=>r.email).join(', ') }</div>`;
+        const dl = document.createElement('button');
+        dl.textContent = 'Decrypt / Download';
+        dl.onclick = async () => {
+          try {
+            dl.disabled = true; dl.textContent = 'Decrypting...';
+            const buf = await tryDecryptFile(data);
+            const blob = new Blob([buf]);
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = data.filename; a.click();
+            URL.revokeObjectURL(url);
+            dl.textContent = 'Decrypt / Download';
+            dl.disabled = false;
+          } catch(e) {
+            alert('Error decrypting: ' + e.message);
+            dl.disabled = false;
+            dl.textContent = 'Decrypt / Download';
+          }
+        };
+        card.appendChild(dl);
+        ownedFilesEl.appendChild(card);
+      }
+    }
+
+    // Query shared files (where recipientsUids contains current uid)
+    const qShared = query(collection(db,'files'), where('recipientsUids','array-contains', currentUser.uid));
+    const sharedSnaps = await getDocs(qShared);
+    if (sharedSnaps.empty) sharedFilesEl.textContent = '(none)';
+    else {
+      for (const d of sharedSnaps.docs) {
+        const data = d.data();
+        // Skip owned files already listed
+        if (data.owner === currentUser.uid) continue;
+        const card = document.createElement('div');
+        card.className = 'box';
+        card.innerHTML = `<strong>${data.filename}</strong><div>fileId: ${d.id}</div><div>owner: ${data.ownerEmail}</div>`;
+        const dl = document.createElement('button');
+        dl.textContent = 'Decrypt / Download';
+        dl.onclick = async () => {
+          try {
+            dl.disabled = true; dl.textContent = 'Decrypting...';
+            const buf = await tryDecryptFile(data);
+            const blob = new Blob([buf]);
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = data.filename; a.click();
+            URL.revokeObjectURL(url);
+            dl.textContent = 'Decrypt / Download';
+            dl.disabled = false;
+          } catch(e) {
+            alert('Error decrypting: ' + e.message);
+            dl.disabled = false;
+            dl.textContent = 'Decrypt / Download';
+          }
+        };
+        card.appendChild(dl);
+        sharedFilesEl.appendChild(card);
+      }
+    }
+  }
+
+  // Make sure to refresh lists periodically or when actions complete
+  // (we already call queryAndRenderFiles after upload and on auth state changes)
+
+  // On load, attempt to show auth state and key status
+  (async () => {
+    // nothing needed; onAuthStateChanged will run
+  })();
+
+  </script>
+</body>
+</html>
